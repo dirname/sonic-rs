@@ -1,15 +1,11 @@
+// Modified for ai-gateway.
 use bytes::Bytes;
 use faststr::FastStr;
 
 use super::LazyValue;
 use crate::{
-    error::Result,
-    index::Index,
-    input::JsonInput,
-    parser::Parser,
-    pointer::PointerTree,
-    reader::{Read, Reader},
-    util::utf8::from_utf8,
+    error::Result, index::Index, input::JsonInput, parser::Parser, pointer::PointerTree,
+    reader::Read,
 };
 
 /// Gets a field from a `path`. And return it as a [`Result<LazyValue>`][crate::LazyValue].
@@ -401,17 +397,11 @@ where
     Path::Item: Index,
 {
     let slice = json.to_u8_slice();
-    let reader = Read::new(slice, false);
+    let reader = Read::new(slice, json.need_utf8_valid());
     let mut parser = Parser::new(reader);
     let (sub, status) = parser.get_from_with_iter(path, true)?;
-    let lv = LazyValue::new(json.from_subset(sub), status.into());
-
-    // validate the utf-8 if slice
-    let index = parser.read.index();
-    if json.need_utf8_valid() {
-        from_utf8(&slice[..index])?;
-    }
-    Ok(lv)
+    parser.check_invalid_utf8(false)?;
+    Ok(LazyValue::new(json.from_subset(sub), status.into()))
 }
 
 /// get_many returns multiple fields from the [`PointerTree`].
@@ -455,15 +445,10 @@ where
     Input: JsonInput<'de>,
 {
     let slice = json.to_u8_slice();
-    let reader = Read::new(slice, false);
+    let reader = Read::new(slice, json.need_utf8_valid());
     let mut parser = Parser::new(reader);
     let nodes = parser.get_many(tree, true)?;
-
-    // validate the utf-8 if slice
-    let index = parser.read.index();
-    if json.need_utf8_valid() {
-        from_utf8(&slice[..index])?;
-    }
+    parser.check_invalid_utf8(false)?;
     Ok(nodes)
 }
 

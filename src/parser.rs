@@ -1,3 +1,4 @@
+// Modified for ai-gateway.
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -141,6 +142,10 @@ macro_rules! check_visit {
     };
 }
 
+mod container;
+
+pub(crate) const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
+
 #[inline(always)]
 pub(crate) fn is_whitespace(ch: u8) -> bool {
     // NOTE: the compiler not optimize as lookup, so we hard code here.
@@ -206,17 +211,13 @@ pub(crate) struct Pair<'de> {
     pub status: ParseStatus,
 }
 
-/// The maximum nesting depth of arrays and objects: deeper JSON returns
-/// [`ErrorCode::RecursionLimitExceeded`] instead of overflowing the stack.
-pub(crate) const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
-
 pub struct Parser<R> {
     pub read: R,
     error_index: usize,   // mark the error position
     nospace_bits: u64,    // SIMD marked nospace bitmap
     nospace_start: isize, // the start position of nospace_bits
-    remaining_depth: u8,  // shared by the serde visitors and the DOM parser
     pub(crate) cfg: DeserializeCfg,
+    pub(crate) remaining_depth: u8,
 }
 
 /// Records the parse status
@@ -245,24 +246,24 @@ where
             error_index: usize::MAX,
             nospace_bits: 0,
             nospace_start: -128,
-            remaining_depth: MAX_ALLOWED_DEPTH,
             cfg: DeserializeCfg::default(),
+            remaining_depth: MAX_ALLOWED_DEPTH,
         }
     }
 
-    /// Enters a nested array or object, failing once [`MAX_ALLOWED_DEPTH`] is reached.
-    #[inline(always)]
-    pub(crate) fn enter_nested(&mut self) -> Result<()> {
-        if self.remaining_depth == 1 {
+    pub(crate) fn enter_container(&mut self) -> Result<()> {
+        if self.remaining_depth <= 1 {
             return perr!(self, RecursionLimitExceeded);
         }
         self.remaining_depth -= 1;
         Ok(())
     }
 
-    #[inline(always)]
-    pub(crate) fn leave_nested(&mut self) {
+    fn with_depth_limit<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.enter_container()?;
+        let result = f(self);
         self.remaining_depth += 1;
+        result
     }
 
     pub fn offset(&self) -> usize {
@@ -301,7 +302,7 @@ where
         // check errors, if exceed, the reason must be eof, and begin parsing the padding chars
         let mut index = self.error_index();
         let len = self.read.as_u8_slice().len();
-        if index > len {
+        if index >= len {
             reason = EofWhileParsing;
             index = len;
         }
@@ -318,7 +319,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn parse_number(&mut self, first: u8) -> Result<ParserNumber> {
         let reader = &mut self.read;
         let neg = first == b'-';
@@ -446,143 +447,6 @@ where
         }
     }
 
-    fn parse_array<V>(
-        &mut self,
-        vis: &mut V,
-        mut strbuf: Option<&mut Vec<u8>>,
-        depth: u8,
-    ) -> Result<()>
-    where
-        V: JsonVisitor<'de>,
-    {
-        check_visit!(self, vis.visit_array_start(0))?;
-
-        let mut first = match self.skip_space() {
-            Some(b']') => return check_visit!(self, vis.visit_array_end(0)),
-            first => first,
-        };
-
-        let mut count = 0;
-        loop {
-            self.dispatch_value(first, vis, &mut strbuf, depth)?;
-            count += 1;
-            // Compact: u16 read for single-instruction matching
-            let sep = self.read.peek_u16();
-            if (sep & 0xFF) == b',' as u16 {
-                let val_ch = (sep >> 8) as u8;
-                if !is_whitespace(val_ch) {
-                    self.read.eat(2);
-                    first = Some(val_ch);
-                    continue;
-                }
-            }
-            if (sep & 0xFF) == b']' as u16 {
-                self.read.eat(1);
-                return check_visit!(self, vis.visit_array_end(count));
-            }
-            // Slow path
-            first = match self.skip_space() {
-                Some(b']') => return check_visit!(self, vis.visit_array_end(count)),
-                Some(b',') => self.skip_space(),
-                _ => return perr!(self, ExpectedArrayCommaOrEnd),
-            };
-        }
-    }
-
-    fn parse_object<V>(
-        &mut self,
-        vis: &mut V,
-        mut strbuf: Option<&mut Vec<u8>>,
-        depth: u8,
-    ) -> Result<()>
-    where
-        V: JsonVisitor<'de>,
-    {
-        let mut count: usize = 0;
-        check_visit!(self, vis.visit_object_start(0))?;
-        match self.skip_space() {
-            Some(b'}') => return check_visit!(self, vis.visit_object_end(0)),
-            Some(b'"') => {}
-            _ => return perr!(self, ExpectObjectKeyOrEnd),
-        }
-
-        loop {
-            // ---- parse key (scalar fast path for short ASCII keys) ----
-            if strbuf.is_none() {
-                self.parse_key_scalar(vis)?;
-            } else {
-                self.parse_string_visit(vis, strbuf.as_deref_mut())?;
-            }
-
-            // ---- find ':' + value start byte ----
-            // Use u16 read: on little-endian, ':' followed by val_ch = (val_ch << 8) | ':'
-            let pair = self.read.peek_u16();
-            let next = if (pair & 0xFF) == b':' as u16 {
-                let val_ch = (pair >> 8) as u8;
-                if !is_whitespace(val_ch) {
-                    self.read.eat(2);
-                    Some(val_ch)
-                } else {
-                    self.parse_object_clo()?;
-                    self.skip_space()
-                }
-            } else {
-                self.parse_object_clo()?;
-                self.skip_space()
-            };
-
-            // ---- parse value ----
-            self.dispatch_value(next, vis, &mut strbuf, depth)?;
-            count += 1;
-
-            // ---- find separator: one u16 read to match `,"` or `}x` ----
-            let sep = self.read.peek_u16();
-            // Little-endian: `,"` = 0x222C, `}x` = (x << 8) | 0x7D
-            if sep == u16::from_le_bytes(*b",\"") {
-                self.read.eat(2);
-                continue;
-            }
-            if (sep & 0xFF) == b'}' as u16 {
-                self.read.eat(1);
-                return check_visit!(self, vis.visit_object_end(count));
-            }
-            // Slow path
-            match self.skip_space() {
-                Some(b'}') => return check_visit!(self, vis.visit_object_end(count)),
-                Some(b',') => match self.skip_space() {
-                    Some(b'"') => continue,
-                    _ => return perr!(self, ExpectObjectKeyOrEnd),
-                },
-                _ => return perr!(self, ExpectedArrayCommaOrEnd),
-            }
-        }
-    }
-
-    /// Dispatch value parsing based on the peeked byte.
-    /// When `strbuf` is None, strings are parsed inplace (zero-copy borrowed).
-    /// When `strbuf` is Some, strings are parsed into the buffer (owned copy).
-    #[inline(always)]
-    fn dispatch_value<V>(
-        &mut self,
-        ch: Option<u8>,
-        vis: &mut V,
-        strbuf: &mut Option<&mut Vec<u8>>,
-        depth: u8,
-    ) -> Result<()>
-    where
-        V: JsonVisitor<'de>,
-    {
-        match ch {
-            Some(c @ b'-' | c @ b'0'..=b'9') => self.parse_number_visit(c, vis, strbuf.is_none()),
-            Some(b'"') => self.parse_string_visit(vis, strbuf.as_deref_mut()),
-            Some(b'{') if depth > 0 => self.parse_object(vis, strbuf.as_deref_mut(), depth - 1),
-            Some(b'[') if depth > 0 => self.parse_array(vis, strbuf.as_deref_mut(), depth - 1),
-            Some(b'{' | b'[') => perr!(self, RecursionLimitExceeded),
-            Some(first) => self.parse_literal_visit(first, vis),
-            None => perr!(self, EofWhileParsing),
-        }
-    }
-
     #[inline(always)]
     fn parse_literal_visit<V>(&mut self, first: u8, vis: &mut V) -> Result<()>
     where
@@ -619,12 +483,20 @@ where
         first: &mut bool,
         check: bool,
     ) -> Result<Option<(&'de [u8], ParseStatus)>> {
-        if *first && self.skip_space() != Some(b'[') {
-            return perr!(self, ExpectedArrayStart);
+        if *first {
+            if self.skip_space() != Some(b'[') {
+                return perr!(self, ExpectedArrayStart);
+            }
+            if check {
+                self.enter_container()?;
+            }
         }
         match self.skip_space_peek() {
             Some(b']') => {
                 self.read.eat(1);
+                if check {
+                    self.remaining_depth += 1;
+                }
                 return Ok(None);
             }
             Some(b',') if !(*first) => {
@@ -646,11 +518,21 @@ where
         first: &mut bool,
         check: bool,
     ) -> Result<Option<Pair<'de>>> {
-        if *first && self.skip_space() != Some(b'{') {
-            return perr!(self, ExpectedObjectStart);
+        if *first {
+            if self.skip_space() != Some(b'{') {
+                return perr!(self, ExpectedObjectStart);
+            }
+            if check {
+                self.enter_container()?;
+            }
         }
         match self.skip_space() {
-            Some(b'}') => return Ok(None),
+            Some(b'}') => {
+                if check {
+                    self.remaining_depth += 1;
+                }
+                return Ok(None);
+            }
             Some(b'"') if *first => *first = false,
             Some(b',') if !*first => {
                 if self.skip_space() != Some(b'"') {
@@ -690,7 +572,9 @@ where
         let start = match c {
             Some(b'"') => {
                 let start = self.read.index() - 1;
-                match self.skip_string()? {
+                let status = self.skip_string()?;
+                self.check_invalid_utf8(false)?;
+                match status {
                     ParseStatus::None => {
                         let slice = self.read.slice_unchecked(start, self.read.index());
                         let raw = self.read.slice_ref(slice).as_faststr();
@@ -712,6 +596,7 @@ where
             }
         };
         let end = self.read.index();
+        self.check_invalid_utf8(false)?;
         let sub = self.read.slice_unchecked(start, end);
         let raw = self.read.slice_ref(sub).as_faststr();
         Ok(OwnedLazyValue::new(raw.into(), HasEsc::Possible))
@@ -790,23 +675,17 @@ where
     }
 
     #[inline(always)]
-    pub(crate) fn parse_dom<V>(
-        &mut self,
-        vis: &mut V,
-        mut strbuf: Option<&mut Vec<u8>>,
-    ) -> Result<()>
+    pub(crate) fn parse_dom<V>(&mut self, vis: &mut V, strbuf: Option<&mut Vec<u8>>) -> Result<()>
     where
         V: JsonVisitor<'de>,
     {
         check_visit!(self, vis.visit_dom_start())?;
         let ch = self.skip_space();
-        // The depth is passed down the recursion, which keeps it in a register.
-        let depth = self.remaining_depth - 1;
-        self.dispatch_value(ch, vis, &mut strbuf, depth)?;
+        self.walk_value::<_, false>(ch, vis, strbuf)?;
         check_visit!(self, vis.visit_dom_end())
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn parse_str<'own>(&mut self, buf: &'own mut Vec<u8>) -> Result<Reference<'de, 'own, str>> {
         match self.parse_string_raw(buf) {
             Ok(ParsedSlice::Copied(buf)) => {
@@ -1076,7 +955,7 @@ where
         perr!(self, EofWhileParsing)
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_next_token<const N: usize>(&mut self, tokens: [u8; N], advance: usize) -> Option<u8> {
         let r = &mut self.read;
         const LANS: usize = u8x32::LANES;
@@ -1110,7 +989,7 @@ where
 
     // skip_string skips a JSON string, and return the later parts after closed quote, and the
     // escaped status. skip_string always start with the quote marks.
-    #[inline(always)]
+    #[inline]
     unsafe fn skip_string_unchecked(&mut self) -> Result<ParseStatus> {
         const LANS: usize = u8x32::LANES;
         let r = &mut self.read;
@@ -1162,22 +1041,15 @@ where
     }
 
     fn skip_escaped_chars(&mut self) -> Result<()> {
-        match self.read.peek() {
+        match self.read.next() {
             Some(b'u') => {
-                if self.read.remain() < 6 {
-                    return perr!(self, EofWhileParsing);
-                } else {
-                    self.read.eat(5);
+                let code = self.parse_escaped_utf8()?;
+                if char::from_u32(code).is_none() {
+                    return perr!(self, InvalidUnicodeCodePoint);
                 }
             }
-            Some(c) => {
-                if self.read.next().is_none() {
-                    return perr!(self, EofWhileParsing);
-                }
-                if ESCAPED_TAB[c as usize] == 0 {
-                    return perr!(self, InvalidEscape);
-                }
-            }
+            Some(c) if ESCAPED_TAB[c as usize] != 0 => {}
+            Some(_) => return perr!(self, InvalidEscape),
             None => return perr!(self, EofWhileParsing),
         }
         Ok(())
@@ -1260,56 +1132,8 @@ where
         }
     }
 
-    #[inline(always)]
-    fn skip_object(&mut self) -> Result<()> {
-        match self.skip_space() {
-            Some(b'}') => return Ok(()),
-            Some(b'"') => {}
-            None => return perr!(self, EofWhileParsing),
-            Some(_) => return perr!(self, ExpectObjectKeyOrEnd),
-        }
-
-        loop {
-            self.skip_string()?;
-            self.parse_object_clo()?;
-            self.skip_one(true)?;
-
-            match self.skip_space() {
-                Some(b'}') => return Ok(()),
-                Some(b',') => match self.skip_space() {
-                    Some(b'"') => continue,
-                    _ => return perr!(self, ExpectObjectKeyOrEnd),
-                },
-                None => return perr!(self, EofWhileParsing),
-                Some(_) => return perr!(self, ExpectedObjectCommaOrEnd),
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn skip_array(&mut self) -> Result<()> {
-        match self.skip_space_peek() {
-            Some(b']') => {
-                self.read.eat(1);
-                return Ok(());
-            }
-            None => return perr!(self, EofWhileParsing),
-            _ => {}
-        }
-
-        loop {
-            self.skip_one(true)?;
-            match self.skip_space() {
-                Some(b']') => return Ok(()),
-                Some(b',') => continue,
-                None => return perr!(self, EofWhileParsing),
-                _ => return perr!(self, ExpectedArrayCommaOrEnd),
-            }
-        }
-    }
-
     /// skip_container skip a object or array, and retu
-    #[inline(always)]
+    #[inline]
     fn skip_container(&mut self, left: u8, right: u8) -> Result<()> {
         let mut prev_instring = 0;
         let mut prev_escaped = 0;
@@ -1356,7 +1180,7 @@ where
         perr!(self, EofWhileParsing)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn skip_space(&mut self) -> Option<u8> {
         let reader = &mut self.read;
         // fast path 1: for nospace or single space
@@ -1613,14 +1437,14 @@ where
             }
             b'{' => {
                 if checked {
-                    self.skip_object()
+                    self.skip_container_checked(ch)
                 } else {
                     self.skip_container(b'{', b'}')
                 }
             }
             b'[' => {
                 if checked {
-                    self.skip_array()
+                    self.skip_container_checked(ch)
                 } else {
                     self.skip_container(b'[', b']')
                 }
@@ -1794,6 +1618,9 @@ where
         // temp buf reused when parsing each escaped key
         let mut temp_buf = Vec::with_capacity(DEFAULT_KEY_BUF_CAPACITY);
         for jp in path.into_iter() {
+            if checked {
+                self.enter_container()?;
+            }
             if let Some(key) = jp.as_key() {
                 self.get_from_object(key, &mut temp_buf, checked)
             } else if let Some(index) = jp.as_index() {
@@ -1833,12 +1660,12 @@ where
             PointerTreeInner::Empty => {
                 status = self.skip_one(true)?.1;
             }
-            PointerTreeInner::Index(midxs) => {
-                self.get_many_index(midxs, strbuf, out, remain, is_safe)?
-            }
-            PointerTreeInner::Key(mkeys) => {
-                self.get_many_keys(mkeys, strbuf, out, remain, is_safe)?
-            }
+            PointerTreeInner::Index(midxs) => self.with_depth_limit(|parser| {
+                parser.get_many_index(midxs, strbuf, out, remain, is_safe)
+            })?,
+            PointerTreeInner::Key(mkeys) => self.with_depth_limit(|parser| {
+                parser.get_many_keys(mkeys, strbuf, out, remain, is_safe)
+            })?,
         };
 
         if !node.order.is_empty() {
@@ -1861,7 +1688,6 @@ where
         remain: &mut usize,
         checked: bool,
     ) -> Result<()> {
-        debug_assert!(strbuf.is_empty());
         match self.skip_space() {
             Some(b'{') => {}
             Some(peek) => return Err(self.peek_invalid_type(peek, &"a JSON object")),
@@ -2127,34 +1953,37 @@ where
                 if should_replace {
                     self.skip_one(true)?;
                 } else {
-                    self.read.eat(1);
-                    match self.skip_space() {
-                        Some(b'"') => {}
-                        Some(b'}') => return Ok(()),
-                        _ => {
-                            return perr!(self, ExpectObjectKeyOrEnd);
-                        }
-                    }
-
-                    loop {
-                        let key = self.parse_str(strbuf)?;
-                        self.parse_object_clo()?;
-                        if let Some(val) = key_values.get_mut(key.deref()) {
-                            self.get_by_schema_rec(val, strbuf)?;
-                        } else {
-                            self.skip_one(true)?;
+                    self.with_depth_limit(|parser| {
+                        parser.read.eat(1);
+                        match parser.skip_space() {
+                            Some(b'"') => {}
+                            Some(b'}') => return Ok(()),
+                            None => return perr!(parser, EofWhileParsing),
+                            _ => return perr!(parser, ExpectObjectKeyOrEnd),
                         }
 
-                        match self.skip_space() {
-                            Some(b',') => match self.skip_space() {
-                                Some(b'"') => continue,
-                                _ => return perr!(self, ExpectObjectKeyOrEnd),
-                            },
-                            Some(b'}') => break,
-                            Some(_) => return perr!(self, ExpectedObjectCommaOrEnd),
-                            None => return perr!(self, EofWhileParsing),
+                        loop {
+                            let key = parser.parse_str(strbuf)?;
+                            parser.parse_object_clo()?;
+                            if let Some(val) = key_values.get_mut(key.deref()) {
+                                parser.get_by_schema_rec(val, strbuf)?;
+                            } else {
+                                parser.skip_one(true)?;
+                            }
+
+                            match parser.skip_space() {
+                                Some(b',') => match parser.skip_space() {
+                                    Some(b'"') => continue,
+                                    None => return perr!(parser, EofWhileParsing),
+                                    _ => return perr!(parser, ExpectObjectKeyOrEnd),
+                                },
+                                Some(b'}') => break,
+                                Some(_) => return perr!(parser, ExpectedObjectCommaOrEnd),
+                                None => return perr!(parser, EofWhileParsing),
+                            }
                         }
-                    }
+                        Ok(())
+                    })?;
                 }
             }
             _ => {

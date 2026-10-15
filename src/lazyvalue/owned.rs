@@ -1,3 +1,4 @@
+// Modified for ai-gateway.
 use std::{
     fmt::{self, Debug, Display},
     str::from_utf8_unchecked,
@@ -536,7 +537,10 @@ impl OwnedLazyValue {
     pub(crate) fn new(raw: JsonSlice, status: HasEsc) -> Self {
         let raw = match raw {
             JsonSlice::Raw(r) => FastStr::new(unsafe { from_utf8_unchecked(r) }),
-            JsonSlice::FastStr(f) => f.clone(),
+            JsonSlice::Bytes(bytes) => {
+                FastStr::from_bytes(bytes).expect("parsed JSON bytes have validated UTF-8")
+            }
+            JsonSlice::FastStr(f) => f,
         };
 
         if status == HasEsc::None {

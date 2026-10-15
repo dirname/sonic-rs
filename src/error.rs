@@ -1,3 +1,4 @@
+// Modified for ai-gateway.
 //! Errors.
 
 // The code is cloned from [serde_json](https://github.com/serde-rs/json) and modified necessary parts.
@@ -258,7 +259,7 @@ pub enum ErrorCode {
     #[error("JSON has non-whitespace trailing characters after the value")]
     TrailingCharacters,
 
-    #[error("Encountered nesting of JSON maps and arrays more than 128 layers deep")]
+    #[error("json nesting limit exceeded")]
     RecursionLimitExceeded,
 
     #[error("Get value from an empty object")]
@@ -503,7 +504,7 @@ fn starts_with_digit(slice: &str) -> bool {
 
 #[cfg(test)]
 mod test {
-    use crate::{from_slice, from_str, Deserialize};
+    use crate::{from_str, Deserialize};
 
     #[test]
     fn test_serde_errors_display() {
@@ -580,7 +581,9 @@ mod test {
             "EOF while parsing at line 1 column 26\n\n\t哈哈哈}\n\t.........^\n"
         );
 
-        let err = from_slice::<Foo>(b"{\"b\":\"\x80\"}").unwrap_err();
+        let err = crate::Deserializer::from_slice(b"{\"b\":\"\x80\"}")
+            .deserialize::<Foo>()
+            .expect_err("strict UTF-8 validation is independent of the utf8_lossy feature");
         assert_eq!(
             format!("{err}"),
             "Invalid UTF-8 characters in json at line 1 column 7\n\n\t{\"b\":\"�\"}\n\t......^..\n"

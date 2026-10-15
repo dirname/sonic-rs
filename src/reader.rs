@@ -1,5 +1,7 @@
+// Modified for ai-gateway.
 use std::{marker::PhantomData, pin::Pin, ptr::NonNull};
 
+use bytes::Bytes;
 use faststr::FastStr;
 
 use crate::{
@@ -96,6 +98,7 @@ pub trait Reader<'de>: Sealed {
 
 enum PinnedInput<'a> {
     FastStr(Pin<Box<FastStr>>),
+    Bytes(Bytes),
     Slice(&'a [u8]),
 }
 
@@ -103,6 +106,7 @@ impl<'a> PinnedInput<'a> {
     unsafe fn as_ptr(&self) -> NonNull<[u8]> {
         match self {
             Self::FastStr(f) => f.as_bytes().into(),
+            Self::Bytes(bytes) => bytes.as_ref().into(),
             Self::Slice(slice) => (*slice).into(),
         }
     }
@@ -110,6 +114,7 @@ impl<'a> PinnedInput<'a> {
     fn slice_ref(&self, subset: &'a [u8]) -> JsonSlice<'a> {
         match self {
             Self::FastStr(f) => JsonSlice::FastStr(f.slice_ref(as_str(subset))),
+            Self::Bytes(bytes) => JsonSlice::Bytes(bytes.slice_ref(subset)),
             Self::Slice(_) => JsonSlice::Raw(subset),
         }
     }
@@ -119,6 +124,7 @@ impl<'a> From<JsonSlice<'a>> for PinnedInput<'a> {
     fn from(input: JsonSlice<'a>) -> Self {
         match input {
             JsonSlice::Raw(slice) => Self::Slice(slice),
+            JsonSlice::Bytes(bytes) => Self::Bytes(bytes),
             JsonSlice::FastStr(f) => Self::FastStr(Pin::new(Box::new(f))),
         }
     }

@@ -1,3 +1,4 @@
+// Modified for ai-gateway.
 use std::{
     borrow::Cow,
     fmt::{self, Debug, Display},
@@ -332,6 +333,7 @@ impl<'a> JsonValueTrait for LazyValue<'a> {
             // #Safety
             // LazyValue is built with JSON validation, so we can use get_unchecked here.
             JsonSlice::Raw(r) => unsafe { get_unchecked(*r, path).ok() },
+            JsonSlice::Bytes(bytes) => unsafe { get_unchecked(bytes, path).ok() },
             JsonSlice::FastStr(f) => unsafe { get_unchecked(f, path).ok() },
         }
     }
@@ -368,6 +370,7 @@ impl<'a> LazyValue<'a> {
     pub fn as_raw_cow(&self) -> Cow<'a, str> {
         match &self.raw {
             JsonSlice::Raw(r) => Cow::Borrowed(unsafe { from_utf8_unchecked(r) }),
+            JsonSlice::Bytes(_) => Cow::Owned(self.as_raw_str().to_owned()),
             JsonSlice::FastStr(f) => Cow::Owned(f.to_string()),
         }
     }
@@ -392,10 +395,7 @@ impl<'a> LazyValue<'a> {
     /// assert_eq!(lv.as_raw_faststr(), "\"hello world\""); // zero-copy
     /// ```
     pub fn as_raw_faststr(&self) -> FastStr {
-        match &self.raw {
-            JsonSlice::Raw(r) => unsafe { FastStr::new_u8_slice_unchecked(r) },
-            JsonSlice::FastStr(f) => f.clone(),
-        }
+        self.raw.as_faststr()
     }
 
     pub fn into_object_iter(mut self) -> Option<ObjectJsonIter<'a>> {
@@ -416,24 +416,12 @@ impl<'a> LazyValue<'a> {
 
     /// get with index from lazyvalue
     pub(crate) fn get_index(&'a self, index: usize) -> Option<Self> {
-        let path = [index];
-        match &self.raw {
-            // #Safety
-            // LazyValue is built with JSON validation, so we can use get_unchecked here.
-            JsonSlice::Raw(r) => unsafe { get_unchecked(*r, path.iter()).ok() },
-            JsonSlice::FastStr(f) => unsafe { get_unchecked(f, path.iter()).ok() },
-        }
+        self.pointer([index])
     }
 
     /// get with key from lazyvalue
     pub(crate) fn get_key(&'a self, key: &str) -> Option<Self> {
-        let path = [key];
-        match &self.raw {
-            // #Safety
-            // LazyValue is built with JSON validation, so we can use get_unchecked here.
-            JsonSlice::Raw(r) => unsafe { get_unchecked(*r, path.iter()).ok() },
-            JsonSlice::FastStr(f) => unsafe { get_unchecked(f, path.iter()).ok() },
-        }
+        self.pointer([key])
     }
 
     pub(crate) fn new(raw: JsonSlice<'a>, status: HasEsc) -> Self {

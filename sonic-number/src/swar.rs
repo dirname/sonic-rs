@@ -146,10 +146,7 @@ mod tests {
 
             // 9-15 digits (8 SWAR + scalar tail)
             assert_eq!(swar_str2int(b"123456789 ", 16), (123456789, 9));
-            assert_eq!(
-                swar_str2int(b"123456789012345 ", 16),
-                (123456789012345, 15)
-            );
+            assert_eq!(swar_str2int(b"123456789012345 ", 16), (123456789012345, 15));
 
             // 16 digits (two SWAR batches)
             assert_eq!(

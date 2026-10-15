@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sonic_number::{parse_number, simd_str2int, swar_str2int, ParserNumber};
 
 // ---- Test data ----
@@ -33,7 +33,7 @@ const INTEGERS: &[&str] = &[
     "12345",
     "123456",
     "1234567",
-    "12345678",            // 8 digits — SWAR boundary
+    "12345678", // 8 digits — SWAR boundary
     "123456789",
     "1234567890",
     "12345678901234",      // 14 digits

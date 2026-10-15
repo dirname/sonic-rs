@@ -1,3 +1,4 @@
+// Modified for ai-gateway.
 use bytes::Bytes;
 use faststr::FastStr;
 
@@ -9,6 +10,7 @@ use crate::{parser::as_str, util::private::Sealed};
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum JsonSlice<'de> {
     Raw(&'de [u8]),
+    Bytes(Bytes),
     FastStr(FastStr), // note: FastStr maybe inlined and in the stack.
 }
 
@@ -17,6 +19,9 @@ impl<'de> JsonSlice<'de> {
     pub(crate) fn as_faststr(&self) -> FastStr {
         match self {
             JsonSlice::Raw(sub) => FastStr::new(as_str(sub)),
+            JsonSlice::Bytes(bytes) => {
+                FastStr::from_bytes(bytes.clone()).expect("parsed JSON bytes have validated UTF-8")
+            }
             JsonSlice::FastStr(f) => f.clone(),
         }
     }
@@ -36,7 +41,7 @@ impl<'de> From<FastStr> for JsonSlice<'de> {
 
 impl<'de> From<Bytes> for JsonSlice<'de> {
     fn from(value: Bytes) -> Self {
-        JsonSlice::FastStr(unsafe { FastStr::from_bytes_unchecked(value) })
+        JsonSlice::Bytes(value)
     }
 }
 
@@ -68,6 +73,7 @@ impl<'de> AsRef<[u8]> for JsonSlice<'de> {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Raw(r) => r,
+            Self::Bytes(bytes) => bytes,
             Self::FastStr(s) => s.as_bytes(),
         }
     }
@@ -123,9 +129,7 @@ impl<'de> JsonInput<'de> for &'de Bytes {
     }
 
     fn to_json_slice(&self) -> JsonSlice<'de> {
-        let bytes = self.as_ref();
-        let newed = self.slice_ref(bytes);
-        JsonSlice::FastStr(unsafe { FastStr::from_bytes_unchecked(newed) })
+        JsonSlice::Bytes((*self).clone())
     }
 
     fn from_subset(&self, sub: &'de [u8]) -> JsonSlice<'de> {
